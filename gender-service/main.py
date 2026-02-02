@@ -20,6 +20,8 @@ from enum import Enum
 from typing import Optional
 import os
 import urllib.request
+import ssl
+import onnxruntime as ort
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -87,12 +89,17 @@ FACE_MODEL = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
 GENDER_PROTO = os.path.join(MODEL_DIR, "gender_deploy.prototxt")
 GENDER_MODEL = os.path.join(MODEL_DIR, "gender_net.caffemodel")
 
+# Liveness detection model (MiniFASNetV2)
+LIVENESS_MODEL_URL = "https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV2.onnx"
+LIVENESS_MODEL_PATH = os.path.join(MODEL_DIR, "MiniFASNetV2.onnx")
+
 GENDER_MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
 GENDER_LIST = ['M', 'F']  # Male, Female
 
 # Global model variables
 face_net = None
 gender_net = None
+liveness_net = None
 
 
 def download_models():
@@ -101,16 +108,22 @@ def download_models():
         (FACE_PROTO, "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/deploy.prototxt"),
         (FACE_MODEL, "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"),
         (GENDER_PROTO, "https://raw.githubusercontent.com/GilLevi/AgeGenderDeepLearning/master/gender_net_definitions/deploy.prototxt"),
+        (GENDER_PROTO, "https://raw.githubusercontent.com/GilLevi/AgeGenderDeepLearning/master/gender_net_definitions/deploy.prototxt"),
         (GENDER_MODEL, "https://www.dropbox.com/s/iyv483wz7ztr9gh/gender_net.caffemodel?dl=1"),
+        (LIVENESS_MODEL_PATH, LIVENESS_MODEL_URL),
     ]
     
     for path, url in models:
         if not os.path.exists(path):
             logger.info(f"Downloading {os.path.basename(path)}...")
             try:
-                # Add headers to avoid 403 errors
+                # Add headers to avoid 403 errors and ignore SSL errors
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                
                 request = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(request) as response:
+                with urllib.request.urlopen(request, context=ctx) as response:
                     with open(path, 'wb') as out_file:
                         out_file.write(response.read())
                 logger.info(f"Downloaded {os.path.basename(path)}")
@@ -121,15 +134,20 @@ def download_models():
 
 def load_models():
     """Load face detection and gender classification models."""
-    global face_net, gender_net
+    global face_net, gender_net, liveness_net
     
-    if face_net is None or gender_net is None:
+    if face_net is None or gender_net is None or liveness_net is None:
         download_models()
         face_net = cv2.dnn.readNet(FACE_MODEL, FACE_PROTO)
         gender_net = cv2.dnn.readNet(GENDER_MODEL, GENDER_PROTO)
+        
+        # Load liveness model
+        providers = ['CPUExecutionProvider']
+        liveness_net = ort.InferenceSession(LIVENESS_MODEL_PATH, providers=providers)
+        
         logger.info("Models loaded successfully")
     
-    return face_net, gender_net
+    return face_net, gender_net, liveness_net
 
 
 def validate_image_file(file: UploadFile) -> None:
@@ -229,6 +247,64 @@ def classify_gender(image_bgr: np.ndarray, face_box: tuple) -> str:
     return GENDER_LIST[gender_idx]
 
 
+def check_liveness(image_bgr: np.ndarray, face_box: tuple) -> float:
+    """
+    Check if the face is real or fake using MiniFASNetV2.
+    Returns a liveness score (higher is more likely real).
+    """
+    # Parameters for MiniFASNetV2
+    scale = 2.7
+    model_input_size = (80, 80)
+    
+    x1, y1, x2, y2 = face_box
+    box_w = x2 - x1
+    box_h = y2 - y1
+    h, w = image_bgr.shape[:2]
+    
+    # Calculate center
+    center_x = x1 + box_w / 2
+    center_y = y1 + box_h / 2
+    
+    # Apply scaling
+    new_w = box_w * scale
+    new_h = box_h * scale
+    
+    # Calculate new coordinates
+    left = max(0, int(center_x - new_w / 2))
+    top = max(0, int(center_y - new_h / 2))
+    right = min(w, int(center_x + new_w / 2))
+    bottom = min(h, int(center_y + new_h / 2))
+    
+    # Crop face
+    face_img = image_bgr[top:bottom, left:right]
+    
+    if face_img.size == 0:
+        return 0.0
+        
+    # Resize to model input size
+    face_img = cv2.resize(face_img, model_input_size)
+    
+    # Preprocess
+    face_img = face_img.astype(np.float32)
+    face_img = np.transpose(face_img, (2, 0, 1)) # HWC -> CHW
+    face_img = np.expand_dims(face_img, axis=0)  # Add batch dimension
+    
+    # Inference
+    input_name = liveness_net.get_inputs()[0].name
+    output_name = liveness_net.get_outputs()[0].name
+    
+    logits = liveness_net.run([output_name], {input_name: face_img})[0]
+    
+    # Softmax
+    probs = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    
+    # Class 1 is "Real", Class 0 is "Fake"
+    real_score = probs[0][1]
+    
+    return float(real_score)
+
+
 def analyze_gender(image_bgr: np.ndarray) -> dict:
     """
     Analyze the image for face detection and gender classification.
@@ -249,12 +325,23 @@ def analyze_gender(image_bgr: np.ndarray) -> dict:
                 "error": "Multiple faces detected. Please ensure only one face is visible."
             }
         
+        # Check liveness
+        liveness_score = check_liveness(image_bgr, faces[0])
+        is_real = liveness_score > 0.5  # Threshold can be adjusted
+        
+        if not is_real:
+            return {
+                "success": False,
+                "error": "Liveness check failed. Please ensure you are capturing a real person."
+            }
+        
         # Classify gender
         gender = classify_gender(image_bgr, faces[0])
         
         return {
             "success": True, 
-            "gender": GenderEnum.MALE if gender == "M" else GenderEnum.FEMALE
+            "gender": GenderEnum.MALE if gender == "M" else GenderEnum.FEMALE,
+            "liveness_score": liveness_score
         }
             
     except Exception as e:
